@@ -11,6 +11,10 @@
         <el-select v-model="store.strategy" size="small" style="width:100px">
           <el-option value="fifo" label="FIFO"/><el-option value="priority" label="优先级"/><el-option value="max_concurrent" label="最大并发"/>
         </el-select>
+        <el-select :model-value="store.role" size="small" style="width:110px" @update:model-value="store.setRole">
+          <el-option value="operator" label="可读写成员"/>
+          <el-option value="viewer" label="只读成员"/>
+        </el-select>
         <el-button type="success" size="small" @click="run" :disabled="!store.workflow" :loading="store.loading">▶ 执行</el-button>
         <span class="ws-dot" :class="{on:store.wsConnected}"></span>
       </div>

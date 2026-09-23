@@ -1,13 +1,15 @@
 import asyncio, time, random, json, threading
 from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from . import field_policy
 
 app = FastAPI(title="DAG Workflow Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ACTIVE_CLIENTS = []
+# WebSocket 连接及其观看角色（默认可读写成员，结果与旧行为一致）
+ACTIVE_CLIENTS = {}
 WORKFLOW_ID = 0
 
 class WorkflowCreate(BaseModel):
@@ -59,23 +61,23 @@ def generate_dag_workflow(name: str):
 
 
 @app.post("/api/workflow")
-def create_workflow(req: WorkflowCreate):
+def create_workflow(req: WorkflowCreate, role: str = Query(field_policy.ROLE_OPERATOR)):
     global WORKFLOW_ID
     WORKFLOW_ID += 1
     dag = generate_dag_workflow(req.name)
-    return {"id": WORKFLOW_ID, "name": req.name, "nodes": dag["nodes"], "edges": dag["edges"],
-            "_durations": dag["durations"]}
+    return field_policy.serialize_creation(
+        WORKFLOW_ID, req.name, dag["nodes"], dag["edges"], dag["durations"], role
+    )
 
 
 @app.post("/api/run")
-def run_workflow(req: RunRequest):
+def run_workflow(req: RunRequest, role: str = Query(field_policy.ROLE_OPERATOR)):
     dag = generate_dag_workflow("workflow")
     t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
     t.start()
-    return {
-        "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
-        "logs": [], "circuitBreakers": [], "completed": False
-    }
+    return field_policy.serialize_execution(
+        dag["nodes"], dag["edges"], [], [], False, role, workflow_id=req.workflowId
+    )
 
 
 def execute_workflow(dag, workers, strategy):
@@ -98,13 +100,12 @@ def execute_workflow(dag, workers, strategy):
     completed = set()
 
     def send_update(completed_flag=False):
-        payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
-            "logs": logs[-30:],
-            "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
-            "completed": completed_flag
-        }
-        for ws in ACTIVE_CLIENTS:
+        for ws, role in list(ACTIVE_CLIENTS.items()):
+            payload = field_policy.serialize_execution(
+                nodes, edges, logs,
+                ([{"taskId": k, **v} for k, v in cb_state.items()]),
+                completed_flag, role
+            )
             try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
             except: pass
         time.sleep(0.3)
@@ -175,10 +176,11 @@ def execute_workflow(dag, workers, strategy):
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
+async def ws_endpoint(ws: WebSocket, role: str = field_policy.ROLE_OPERATOR):
+    role = field_policy.normalize_role(role)
     await ws.accept()
-    ACTIVE_CLIENTS.append(ws)
+    ACTIVE_CLIENTS[ws] = role
     try:
         while True: await ws.receive_text()
     except:
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        ACTIVE_CLIENTS.pop(ws, None)
