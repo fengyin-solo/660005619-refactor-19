@@ -1,22 +1,29 @@
 import asyncio, time, random, json, threading
 from collections import defaultdict, deque
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from .execution_presenter import serialize_execution, serialize_workflow
+from .field_policy import EDITOR_ROLE, get_field_definitions, normalize_role, normalize_view
 
 app = FastAPI(title="DAG Workflow Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ACTIVE_CLIENTS = []
+ACTIVE_CLIENTS: dict = {}
 WORKFLOW_ID = 0
 
 class WorkflowCreate(BaseModel):
     name: str = "data-pipeline"
+    role: str = EDITOR_ROLE
+    view: str = "page"
 
 class RunRequest(BaseModel):
     workflowId: int
     workers: int = 3
     strategy: str = "fifo"
+    role: str = EDITOR_ROLE
+    view: str = "page"
 
 
 def generate_dag_workflow(name: str):
@@ -63,19 +70,41 @@ def create_workflow(req: WorkflowCreate):
     global WORKFLOW_ID
     WORKFLOW_ID += 1
     dag = generate_dag_workflow(req.name)
-    return {"id": WORKFLOW_ID, "name": req.name, "nodes": dag["nodes"], "edges": dag["edges"],
-            "_durations": dag["durations"]}
+    role = normalize_role(req.role)
+    view = normalize_view(req.view)
+    workflow = serialize_workflow(dag, WORKFLOW_ID, req.name, role, view)
+    return {**workflow, "_durations": dag["durations"]}
+
+
+@app.get("/api/execution-fields")
+def execution_fields(
+    role: str = Query(EDITOR_ROLE),
+    view: str = Query("page"),
+):
+    return {
+        "role": normalize_role(role),
+        "view": normalize_view(view),
+        "fields": get_field_definitions(role, view),
+    }
 
 
 @app.post("/api/run")
 def run_workflow(req: RunRequest):
     dag = generate_dag_workflow("workflow")
+    role = normalize_role(req.role)
+    view = normalize_view(req.view)
     t = threading.Thread(target=execute_workflow, args=(dag, req.workers, req.strategy), daemon=True)
     t.start()
-    return {
-        "workflow": {"id": req.workflowId, "name": "workflow", "nodes": dag["nodes"], "edges": dag["edges"]},
-        "logs": [], "circuitBreakers": [], "completed": False
-    }
+    return serialize_execution(
+        nodes=dag["nodes"],
+        edges=dag["edges"],
+        logs=[],
+        circuit_breakers=[],
+        completed=False,
+        workflow_id=req.workflowId,
+        role=role,
+        view=view,
+    )
 
 
 def execute_workflow(dag, workers, strategy):
@@ -98,15 +127,29 @@ def execute_workflow(dag, workers, strategy):
     completed = set()
 
     def send_update(completed_flag=False):
-        payload = {
-            "workflow": {"id": 1, "name": "workflow", "nodes": nodes, "edges": edges},
-            "logs": logs[-30:],
-            "circuitBreakers": [{"taskId": k, **v} for k, v in cb_state.items()],
-            "completed": completed_flag
-        }
-        for ws in ACTIVE_CLIENTS:
-            try: asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), asyncio.get_event_loop())
-            except: pass
+        disconnected = []
+        for ws, client in list(ACTIVE_CLIENTS.items()):
+            payload = serialize_execution(
+                nodes=nodes,
+                edges=edges,
+                logs=logs,
+                circuit_breakers=[{"taskId": k, **v} for k, v in cb_state.items()],
+                completed=completed_flag,
+                workflow_id=1,
+                workflow_name="workflow",
+                role=client["role"],
+                view=client["view"],
+            )
+            loop = client["loop"]
+            if not loop.is_running():
+                disconnected.append(ws)
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(payload)), loop)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            ACTIVE_CLIENTS.pop(ws, None)
         time.sleep(0.3)
 
     while ready or running_tasks:
@@ -177,8 +220,13 @@ def execute_workflow(dag, workers, strategy):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    ACTIVE_CLIENTS.append(ws)
+    role = normalize_role(ws.query_params.get("role", EDITOR_ROLE))
+    view = normalize_view(ws.query_params.get("view", "page"))
+    ACTIVE_CLIENTS[ws] = {"role": role, "view": view, "loop": asyncio.get_running_loop()}
     try:
-        while True: await ws.receive_text()
-    except:
-        if ws in ACTIVE_CLIENTS: ACTIVE_CLIENTS.remove(ws)
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ACTIVE_CLIENTS.pop(ws, None)
